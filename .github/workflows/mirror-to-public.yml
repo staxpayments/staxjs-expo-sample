@@ -1,0 +1,138 @@
+# One-way publish: EMU private source of truth -> github.com/staxpayments public mirror.
+# CMD-5730 (epic CMD-5605). Aligned to the Public GitHub Org Hardening Standard
+# (Confluence 847216662).
+#
+# Direction: this GHE repo (stax-core/<repo>) is canonical. On every push to the
+# default branch or a tag, and on every published release, this workflow force-
+# forwards that content to github.com/staxpayments/<repo>. Nothing but this sync
+# (or a break-glass admin PR) writes to the mirror; the mirror's ruleset makes the
+# sync App the sole direct-push bypass actor.
+#
+# Identity: a GitHub App installed on github.com/staxpayments. staxpayments enforces
+# SAML, and App installation tokens are not subject to per-user SAML authorization,
+# so a PAT would break (CMD-5726). The App private key + id live as GHE secrets;
+# this job mints a short-lived github.com installation token at run time.
+#
+# Prereqs (see setup-public-mirror.sh and the CMD-5730 checklist):
+#   - GHE org/repo secrets: MIRROR_APP_ID, MIRROR_APP_PRIVATE_KEY (PEM).
+#   - The App is installed on github.com/staxpayments with contents:write,
+#     metadata:read, workflows:write (SDK head trees carry .github/workflows).
+#   - github.com/staxpayments/<repo> exists, hardened, Actions disabled, with a
+#     ruleset whose only direct-push bypass actor is the App.
+#
+# Install: copy to .github/workflows/mirror-to-public.yml in the GHE source repo
+# and set DEFAULT_BRANCH below to that repo's default branch.
+#
+# Push is FAST-FORWARD, not force (the standard blocks force-push on the mirror).
+# If the mirror ever diverges (tampering, or a source-side history rewrite) the
+# push fails loud rather than silently overwriting; resolve by hand. Secret safety
+# is the mirror's push protection: a leaked secret in the source head blocks the
+# sync push (the App is not exempt from push protection).
+
+name: mirror-to-public
+
+on:
+  push:
+    branches: [main]
+    tags: ['**']
+  release:
+    types: [published, edited]
+  workflow_dispatch: {}   # initial seed / manual re-sync
+
+concurrency:
+  group: mirror-to-public
+  cancel-in-progress: false
+
+env:
+  DEFAULT_BRANCH: main
+  MIRROR_ORG: staxpayments
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags for a faithful mirror
+
+      - name: Mint a github.com installation token for the mirror App
+        id: token
+        env:
+          APP_ID: ${{ secrets.MIRROR_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.MIRROR_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APP_ID:-}" ] || [ -z "${APP_PRIVATE_KEY:-}" ]; then
+            echo "::error::MIRROR_APP_ID / MIRROR_APP_PRIVATE_KEY not set on this repo/org"
+            exit 1
+          fi
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          now=$(date +%s)
+          header=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+          payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now-60))" "$((now+540))" "$APP_ID" | b64url)
+          keyfile=$(mktemp); printf '%s' "$APP_PRIVATE_KEY" > "$keyfile"
+          sig=$(printf '%s.%s' "$header" "$payload" | openssl dgst -binary -sha256 -sign "$keyfile" | b64url)
+          rm -f "$keyfile"
+          jwt="$header.$payload.$sig"
+          # installation id for the staxpayments org
+          inst=$(curl -sS -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" \
+                   https://api.github.com/app/installations \
+                 | jq -r '.[] | select(.account.login=="'"$MIRROR_ORG"'") | .id')
+          if [ -z "$inst" ] || [ "$inst" = "null" ]; then
+            echo "::error::App is not installed on github.com/$MIRROR_ORG"; exit 1
+          fi
+          tok=$(curl -sS -X POST -H "Authorization: Bearer $jwt" -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/app/installations/$inst/access_tokens" | jq -r '.token')
+          if [ -z "$tok" ] || [ "$tok" = "null" ]; then
+            echo "::error::failed to mint installation token"; exit 1
+          fi
+          echo "::add-mask::$tok"
+          echo "token=$tok" >> "$GITHUB_OUTPUT"
+
+      - name: Publish default branch + tags to the mirror (fast-forward)
+        env:
+          GH_COM_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY##*/}"
+          git remote add mirror "https://x-access-token:${GH_COM_TOKEN}@github.com/${MIRROR_ORG}/${repo}.git"
+          # default branch: fast-forward only. A non-ff (divergence) fails loud.
+          if ! git push mirror "HEAD:refs/heads/${DEFAULT_BRANCH}"; then
+            echo "::error::default-branch push rejected (mirror diverged or push protection blocked a secret). Resolve manually; do not force."
+            exit 1
+          fi
+          # tags: SDK consumers pin to version tags (CocoaPods/SPM/npm). Do not force.
+          git push mirror --tags
+
+      - name: Sync the release object on the mirror
+        if: github.event_name == 'release'
+        env:
+          GH_COM_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY##*/}"
+          tag="${{ github.event.release.tag_name }}"
+          # Mirror the release metadata (title, notes, prerelease/draft flags) keyed
+          # to the already-pushed tag. Binary assets are NOT synced in v1 (SDK
+          # consumers resolve source at tags; asset sync is a follow-on).
+          body=$(jq -Rs . <<< "${{ github.event.release.body }}")
+          existing=$(curl -sS -H "Authorization: token ${GH_COM_TOKEN}" \
+                       "https://api.github.com/repos/${MIRROR_ORG}/${repo}/releases/tags/${tag}" \
+                     | jq -r '.id // empty')
+          payload=$(jq -nc --arg tag "$tag" \
+                            --arg name "${{ github.event.release.name }}" \
+                            --argjson body "$body" \
+                            --argjson pre ${{ github.event.release.prerelease }} \
+                            '{tag_name:$tag, name:$name, body:$body, prerelease:$pre, draft:false}')
+          if [ -n "$existing" ]; then
+            curl -sS -X PATCH -H "Authorization: token ${GH_COM_TOKEN}" \
+              "https://api.github.com/repos/${MIRROR_ORG}/${repo}/releases/${existing}" -d "$payload" >/dev/null
+            echo "updated mirror release for ${tag}"
+          else
+            curl -sS -X POST -H "Authorization: token ${GH_COM_TOKEN}" \
+              "https://api.github.com/repos/${MIRROR_ORG}/${repo}/releases" -d "$payload" >/dev/null
+            echo "created mirror release for ${tag}"
+          fi
